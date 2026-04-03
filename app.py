@@ -1,107 +1,86 @@
 import streamlit as st
 import pandas as pd
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import folium
 from streamlit_folium import st_folium
+import time
 
-# --- 1. NEW FOCUSED AREA (Arran to Lanark / Balloch to Sanquhar) ---
+# --- 1. CONFIG & AREA ---
 LAT_MIN, LAT_MAX = 55.3, 56.1   # Sanquhar to Balloch
 LON_MIN, LON_MAX = -5.4, -3.6   # Arran to Lanark
-CUMNOCK_LAT, CUMNOCK_LON = 55.4542, -4.2673
+CUMNOCK = [55.4542, -4.2673]
 
-st.set_page_config(page_title="Ayrshire & Central Radar", layout="wide")
+st.set_page_config(page_title="Ayrshire Radar", layout="wide")
+st.title("✈️ Ayrshire & Central Flight Radar")
 
-st.title("✈️ Live Radar: GLA, PIK & Cumnock Area")
-st.write("Focused on Arran to Lanark / Balloch to Sanquhar.")
-
-# Airline lookup
-AIRLINES = {
-    "RYR": "Ryanair", "EZY": "EasyJet", "LOG": "Loganair", 
-    "EXS": "Jet2", "BAW": "British Airways", "NPT": "Atlantic Airlines", 
-    "BOX": "DHL", "FDX": "FedEx", "TAY": "ASL Airlines"
-}
-
-# --- 2. DATA FETCHING ---
-def get_flight_data():
-    try:
-        user = st.secrets["OPENSKY_USER"]
-        password = st.secrets["OPENSKY_PASS"]
-    except:
-        st.error("Error: Check your Streamlit Secrets for credentials.")
-        return pd.DataFrame()
-
+# --- 2. THE "SMART" DATA FETCHING ---
+# This caches the data for 30 seconds so your family doesn't 
+# accidentally spam the API and get blocked.
+@st.cache_data(ttl=30)
+def get_flight_data_hardened():
+    user = st.secrets["OPENSKY_USER"]
+    password = st.secrets["OPENSKY_PASS"]
     url = f"https://opensky-network.org/api/states/all?lamin={LAT_MIN}&lamax={LAT_MAX}&lomin={LON_MIN}&lomax={LON_MAX}"
     
+    # Set up a "Retry Strategy"
+    session = requests.Session()
+    retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+    session.mount('https://', HTTPAdapter(max_retries=retries))
+
     try:
-        # Request data with a 20s timeout
-        r = requests.get(url, auth=(user, password), timeout=20)
+        # Request with a longer 30s timeout and the retry strategy
+        r = session.get(url, auth=(user, password), timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        states = data.get("states", [])
         
-        if r.status_code == 200:
-            data = r.json()
-            states = data.get("states", [])
-            if not states:
-                return pd.DataFrame()
+        if not states:
+            return pd.DataFrame()
             
-            columns = ['icao24', 'callsign', 'origin', 'time', 'contact', 'lon', 'lat', 'alt', 'ground', 'vel', 'deg', 'vert', 'sens', 'geo', 'sqwk', 'spi', 'src']
-            return pd.DataFrame(states, columns=columns)
-        elif r.status_code == 503:
-            st.warning("OpenSky server is temporarily busy. Please wait a moment.")
-            return pd.DataFrame()
-        else:
-            return pd.DataFrame()
+        columns = ['icao24', 'callsign', 'origin', 'time', 'contact', 'lon', 'lat', 'alt', 'ground', 'vel', 'deg', 'vert', 'sens', 'geo', 'sqwk', 'spi', 'src']
+        return pd.DataFrame(states, columns=columns)
 
     except Exception as e:
-        st.error(f"Waiting for OpenSky connection... ({e})")
-        return pd.DataFrame()
+        return f"Error: {e}"
 
-# --- 3. UI CONTROLS ---
-if st.button('🔄 Refresh Radar'):
-    st.cache_data.clear()
+# --- 3. UI LAYOUT ---
+col1, col2 = st.columns([1, 1])
 
-df = get_flight_data()
+with col1:
+    if st.button('🔄 Refresh Map'):
+        st.cache_data.clear()
+        st.rerun()
 
-# --- 4. MAP VISUALIZATION ---
-# Focused on the midpoint between GLA and PIK
+with col2:
+    # BACKUP LINK: If the API is failing, your family can click this
+    backup_url = f"https://globe.adsbexchange.com/?lat={CUMNOCK[0]}&lon={CUMNOCK[1]}&zoom=10"
+    st.markdown(f'''<a href="{backup_url}" target="_blank"><button style="background-color:#FF4B4B; color:white; border:none; padding:10px; border-radius:5px; cursor:pointer;">⚠️ API Slow? Use Backup Map</button></a>''', unsafe_allow_html=True)
+
+# --- 4. PROCESSING ---
+result = get_flight_data_hardened()
+
+# Create Map
 m = folium.Map(location=[55.65, -4.4], zoom_start=10, tiles='CartoDB dark_matter')
+folium.Marker(CUMNOCK, tooltip="Cumnock", icon=folium.Icon(color='red', icon='home')).add_to(m)
 
-# Marker for Cumnock
-folium.Marker(
-    [CUMNOCK_LAT, CUMNOCK_LON], 
-    tooltip="Cumnock", 
-    icon=folium.Icon(color='red', icon='home')
-).add_to(m)
-
-if not df.empty:
-    for _, row in df.iterrows():
+if isinstance(result, pd.DataFrame) and not result.empty:
+    for _, row in result.iterrows():
         if row['lat'] and row['lon']:
-            callsign = row['callsign'].strip() if row['callsign'] else "N/A"
-            airline = AIRLINES.get(callsign[:3], "Unknown/Private")
-            alt_ft = int(row['alt'] * 3.28) if row['alt'] else 0
-            speed_mph = int(row['vel'] * 2.237) if row['vel'] else 0
-            
-            fr24_link = f"https://www.flightradar24.com/{callsign}"
-            
-            popup_html = f"""
-                <div style="font-family: Arial; width: 160px;">
-                    <b style="color:#007bff;">{callsign}</b><br>
-                    {airline}<br>
-                    {alt_ft:,} ft | {speed_mph} mph<br>
-                    <a href="{fr24_link}" target="_blank">View on FR24</a>
-                </div>
-            """
+            callsign = row['callsign'].strip() or "N/A"
+            alt = int(row['alt'] * 3.28) if row['alt'] else 0
             
             folium.Marker(
                 [row['lat'], row['lon']],
-                popup=folium.Popup(popup_html, max_width=200),
-                tooltip=f"{callsign}",
-                icon=folium.Icon(color='blue' if not row['ground'] else 'lightgray', icon='plane')
+                popup=f"Flight: {callsign}<br>Alt: {alt}ft",
+                icon=folium.Icon(color='blue', icon='plane')
             ).add_to(m)
-
-# Display Map
-st_folium(m, width="100%", height=650)
-
-if not df.empty:
-    with st.expander("Show List View"):
-        st.dataframe(df[['callsign', 'alt', 'vel']])
+    st.success(f"Found {len(result)} aircraft.")
+elif isinstance(result, str):
+    st.error("The OpenSky server is currently overloaded.")
+    st.info("This is common during busy hours. Please use the 'Backup Map' button above or try again in a few minutes.")
 else:
-    st.info("No planes currently in the Arran-Lanark-Balloch-Sanquhar box.")
+    st.info("No planes currently in the specific Arran-Lanark box.")
+
+st_folium(m, width="100%", height=600)
